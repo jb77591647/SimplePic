@@ -1,9 +1,12 @@
 # capture SimplePic main window via PrintWindow -> docs/screenshot.png
-import ctypes, ctypes.wintypes as wt, subprocess, time, sys, struct
+# 裁剪到 DWM 扩展框架边界（真实可见窗口）：PrintWindow 会把 DWM 不可见边框/
+# 阴影区渲染成黑色，直接落盘会在截图四周出现大黑边
+import ctypes, ctypes.wintypes as wt, subprocess, time, sys
 from PIL import Image
 
 u32 = ctypes.windll.user32
 gdi = ctypes.windll.gdi32
+dwm = ctypes.windll.dwmapi
 u32.SetProcessDPIAware()
 
 subprocess.run(["taskkill", "/f", "/im", "SimplePic.exe"], capture_output=True)
@@ -20,6 +23,11 @@ time.sleep(0.8)
 r = wt.RECT()
 u32.GetWindowRect(hwnd, ctypes.byref(r))
 w, h = r.right - r.left, r.bottom - r.top
+
+# DWM 真实可见边界（去掉不可见缩放边框与阴影）
+fb = wt.RECT()
+if dwm.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(fb), ctypes.sizeof(fb)) != 0:
+    fb = r  # 拿不到（老系统）退回整窗
 
 hdc_wnd = u32.GetWindowDC(hwnd)
 hdc_mem = gdi.CreateCompatibleDC(hdc_wnd)
@@ -45,6 +53,9 @@ u32.ReleaseDC(hwnd, hdc_wnd)
 
 if not ok or not got:
     print("PrintWindow failed", ok, got); sys.exit(1)
-img = Image.frombuffer("RGBA", (w, h), buf.raw, "raw", "BGRA", 0, 1)
+img = Image.frombuffer("RGBA", (w, h), buf.raw, "raw", "BGRA", 0, 1).convert("RGB")
+# 按 DWM 可见边界裁剪（偏移 = 框架边界 - 窗口矩形原点）
+box = (fb.left - r.left, fb.top - r.top, fb.right - r.left, fb.bottom - r.top)
+img = img.crop(box)
 img.save(r"E:\TRAE Project\SimplePic\docs\screenshot.png")
-print("captured", w, "x", h)
+print("captured", w, "x", h, "-> crop", img.size)

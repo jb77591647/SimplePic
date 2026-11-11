@@ -4,6 +4,8 @@ Windows 桌面图片批量处理工具。单文件 exe、纯 Win32 自绘 UI（�
 
 ![平台](https://img.shields.io/badge/platform-Windows%2064bit-blue) ![语言](https://img.shields.io/badge/C%2B%2B-17-blue) ![构建](https://img.shields.io/badge/build-MSVC%20cl.exe-orange)
 
+![SimplePic 主界面](docs/screenshot.png)
+
 ## 功能
 
 | 分组 | 模块 | 说明 |

@@ -1626,7 +1626,7 @@ static LRESULT CALLBACK pop_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             if (g_pv_pop_src_ok) {
                 int mid = (rc.left + rc.right) / 2;
                 int top = rc.top + S(12);
-                int img_top = top + S(24);
+                int img_top = top + S(26); // 标签带随字号（small+4px）加高
                 int bottom = rc.bottom - S(16);
                 RECT limg = {rc.left + S(16), img_top, mid - S(8), bottom};
                 RECT rimg = {mid + S(8), img_top, rc.right - S(16), bottom};
@@ -2308,29 +2308,11 @@ static void draw_panel(const DRAWITEMSTRUCT* dis) {
     SelectObject(dc, ropen_); SelectObject(dc, robr);
     DeleteObject(rpen);
 
-    // 底部说明条：预计输出体积（与列表/统计卡同一套估算）
+    // 底部说明条：固定操作提示（预计输出体积已由列表"预计输出"列与统计卡承载）
     RECT cap = {card.left + S(8), card.bottom - S(22), card.right - S(8), card.bottom - S(4)};
     const sp::Image* img = nullptr;
-    wchar_t cs[96] = L"";
-    COLORREF cap_c = C_TEXT2;
-    if (g_pv.item < 0 || g_pv.item >= (int)g_files.size()) {
-        wcscpy_s(cs, L"未选中文件");
-    } else if (!g_pv.src_ok) {
-        wcscpy_s(cs, L"原图加载失败");
-    } else {
-        Params p;
-        collect_params(p);
-        long long kb = est_kb_for(g_files[g_pv.item], p);
-        wchar_t kbbuf[24];
-        if (kb > 0) fmt_est_kb(kb, kbbuf, 24);
-        else wcscpy_s(kbbuf, L"—");
-        if (g_pv.dst_ok) {
-            img = &g_pv.dst;
-            cap_c = C_GREEN;
-            if (g_pv.pixel_same) swprintf(cs, 96, L"预计输出 · %s · 像素不变", kbbuf);
-            else swprintf(cs, 96, L"预计输出 · %s（实时预测）", kbbuf);
-        }
-    }
+    if (g_pv.item >= 0 && g_pv.item < (int)g_files.size() && g_pv.src_ok && g_pv.dst_ok)
+        img = &g_pv.dst;
 
     // 图像区（卡内去掉说明条）
     RECT ir = {card.left + S(6), card.top + S(6), card.right - S(6), cap.top - S(2)};
@@ -2342,7 +2324,8 @@ static void draw_panel(const DRAWITEMSTRUCT* dis) {
         draw_text(dc, L"选中文件，此处实时预览处理效果",
                   ir, C_GRAY, g_font_small, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
-    draw_text(dc, cs, cap, cap_c, g_font_small, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    draw_text(dc, L"单击预览窗打开原图和预览图对比视图",
+              cap, C_TEXT2, g_font_small, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 }
 
 // ---------- 自绘：主区域背景（模块头部 + 统计卡 + 工具栏条） ----------
@@ -2990,7 +2973,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_font       = CreateFontW(-S(13), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
         g_font_bold  = CreateFontW(-S(13), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
         g_font_small = CreateFontW(-S(11), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
-        g_font_pv    = CreateFontW(-(S(11) + 2), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI"); // 预览对比窗标签：small 加大 2px
+        g_font_pv    = CreateFontW(-(S(11) + 4), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI"); // 预览对比窗标签：small 累计加大 4px
         g_font_h1    = CreateFontW(-S(16), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
         g_font_num   = CreateFontW(-S(20), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI"); // 统计卡数字：放大强调
         g_brush_white = CreateSolidBrush(C_CARD); // 参数控件在卡片内：背景=卡片色 F8F9FD

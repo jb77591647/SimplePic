@@ -147,6 +147,7 @@ static int g_dpi = 96;
 static int g_last_cx = 0, g_last_cy = 0; // 上次客户区尺寸（WM_SIZE 去重）
 static int g_name_col = 0; // 列0宽（layout_controls 计算，paint_workspace 自绘列标题用）
 static int g_cw[7] = {};   // 7列宽（0文件名 1尺寸 2原体积 3预计输出 4状态 5输出体积 6移除✕）
+static int g_cw_applied[7] = {}; // 已下发到 ListView 的列宽（布局去重：仅变化列才 SetColumnWidth，拖拽窗体不卡顿）
 static int g_cw_user[6] = {0}; // 用户拖拽设定的列宽（0=未设定，布局仍自动计算）
 static int g_col_drag = -1;    // 正在拖拽右边界调整宽度的列（0..5），-1=无
 static int g_col_drag_x0 = 0;  // 拖拽起点鼠标 x
@@ -165,7 +166,7 @@ static int nc_frame_cy(DWORD style, int dpi) {
     return fr.bottom - fr.top;
 }
 static Pipeline g_pipe;
-static HFONT g_font, g_font_bold, g_font_small, g_font_h1, g_font_num;
+static HFONT g_font, g_font_bold, g_font_small, g_font_h1, g_font_num, g_font_pv;
 static HBRUSH g_brush_white, g_brush_panel, g_brush_side, g_brush_sep;
 
 static const wchar_t* kExtFilter[] = {L"jpg", L"jpeg", L"png", L"gif", L"bmp", L"webp", L"tif", L"tiff",
@@ -481,6 +482,17 @@ static void update_pdfmerge_state() {
             EnableWindow(e.hwnd, pdf ? TRUE : FALSE);
 }
 
+// 压缩到指定大小：仅当下拉选"自定义"（第 5 项）时允许编辑自定义目标体积
+static void update_target_custom_state() {
+    bool custom = false;
+    for (auto& c : g_ctls)
+        if (c.type == CTL_COMBO && c.module == 2)
+            custom = (int)SendMessageW(c.hwnd, CB_GETCURSEL, 0, 0) == 4;
+    for (auto& e : g_ctls)
+        if (e.type == CTL_EDIT && e.module == 16)
+            EnableWindow(e.hwnd, custom ? TRUE : FALSE);
+}
+
 // ---------- 右键菜单注册（HKCU，免提权） ----------
 // 图片扩展名白名单（与 kExtFilter 拖入白名单一致）：仅这些扩展名显示右键菜单。
 // 注意：静态动词直接挂在 HKCU\...\.<ext>\shell 下在 Win10/11 不可靠（扩展名
@@ -622,11 +634,13 @@ static void rebuild_param_panel() {
         update_idphoto_custom_state();
         break;
     case MOD_COMPRESS_TARGET:
-        add_ctl(CTL_COMBO, L"目标体积", {L"100 KB", L"200 KB", L"500 KB", L"1000 KB"}, 2);
+        add_ctl(CTL_COMBO, L"目标体积", {L"100 KB", L"200 KB", L"500 KB", L"1000 KB", L"自定义"}, 2);
+        add_ctl(CTL_EDIT, L"自定义目标体积 KB（小于 1 按 1 KB 处理）", {L"50"}, 16);
         add_ctl(CTL_CHECK, L"小于目标时填充元数据到达标", {}, 3);
         for (auto& c : g_ctls)
             if (c.type == CTL_CHECK && c.module == 3)
                 SendMessageW(c.hwnd, BM_SETCHECK, BST_UNCHECKED, 0);
+        update_target_custom_state();
         break;
     case MOD_COMPRESS_LIVE:
         add_ctl(CTL_SLIDER, L"压缩质量", {}, 20);
@@ -733,7 +747,9 @@ static void collect_params(Params& p) {
             if (sel < 0) sel = 0;
             switch (base) {
             case 1: p.id_photo = sel; break;
-            case 2: p.target_kb = kTargetKb[std::min(sel, 3)]; break;
+            case 2: // 目标体积：前 4 项为预设；"自定义"（第 5 项）由下方输入框（module 16）提供
+                if (sel <= 3) p.target_kb = kTargetKb[std::min(sel, 3)];
+                break;
             case 6: p.crop_ratio_idx = sel + 1; break;
             case 7: { // 输出格式：UI 序（JPG/PNG/BMP/TIFF/GIF/WebP/PDF）→ 算子格式码
                 static const int kOutFmt[] = {0, 1, 2, 4, 5, 6, 3};
@@ -771,6 +787,13 @@ static void collect_params(Params& p) {
             if (base == 12 && v > 0) p.id_custom_h = v;
             if (base == 13 && v > 0) p.crop_w = v;
             if (base == 14 && v > 0) p.crop_h = v;
+            if (base == 16) { // 自定义目标体积：仅下拉选"自定义"时生效；<1KB 自动退回 1KB
+                bool custom = false;
+                for (auto& c2 : g_ctls)
+                    if (c2.type == CTL_COMBO && c2.module == 2)
+                        custom = (int)SendMessageW(c2.hwnd, CB_GETCURSEL, 0, 0) == 4;
+                if (custom) p.target_kb = v > 0 ? v : 1;
+            }
             if (base == 21) p.wm_text = buf; // 文字水印内容
             if (base == 22) p.wm_font_size = std::min(500, std::max(6, v)); // 越界钳到边界，不回退默认
             if (base == 28) p.wm_spacing = (v >= 10 && v <= 2000) ? v : 80;
@@ -1134,10 +1157,16 @@ static void preview_decode_async(std::wstring path) {
 
 // ---------- 大图预览弹窗 ----------
 static HWND g_pv_pop = nullptr;   // 弹窗句柄（null=未打开）
-static sp::Image g_pv_pop_img;    // 弹窗缓存的大图（BGRA）
+static sp::Image g_pv_pop_img;    // 弹窗缓存的大图（BGRA，处理完成后）
 static bool g_pv_pop_ok = false;
-static void load_preview_popup_image();
-static void open_preview_popup();
+static sp::Image g_pv_pop_src_img;    // 弹窗缓存的原图（BGRA）
+static bool g_pv_pop_src_ok = false;
+static bool g_pv_pop_compare = false; // true=对比模式（左原图/右处理后）；false=单图预览（原图）
+static double g_pv_zoom = 1.0;             // 弹窗缩放倍数（1=适配窗口，滚轮 ±25%）
+static int g_pv_pan_x = 0, g_pv_pan_y = 0; // 缩放后平移偏移（弹窗客户区 px，左键拖拽）
+static std::wstring g_pv_pop_src_label, g_pv_pop_dst_label; // 对比模式顶部标签（体积+分辨率）
+static void load_preview_popup_image(bool orig_only);
+static void open_preview_popup(bool compare);
 
 // stb 解码是 RGBA，GDI 32bpp 按 BGRA 解释，交换 R/B
 static void preview_bgra(sp::Image& im) {
@@ -1313,7 +1342,7 @@ static void refresh_preview() {
         }
     }
     // 大图预览弹窗打开时，同步重载内容（参数/文件已变）
-    if (g_pv_pop) { load_preview_popup_image(); InvalidateRect(g_pv_pop, nullptr, TRUE); }
+    if (g_pv_pop) { load_preview_popup_image(!g_pv_pop_compare); InvalidateRect(g_pv_pop, nullptr, TRUE); }
     InvalidateRect(g_param_panel, nullptr, FALSE);
 }
 
@@ -1338,6 +1367,33 @@ static void draw_image_fit(HDC dc, RECT ir, const sp::Image& im) {
     StretchDIBits(dc, dx, dy, dw, dh, 0, 0, im.w, im.h,
                   im.px.data(), &bmi, DIB_RGB_COLORS, SRCCOPY);
     if (prev_mode) SetStretchBltMode(dc, prev_mode);
+}
+
+// 带缩放/平移的绘制（弹窗滚轮缩放）：z=1 时等价 draw_image_fit（fit 居中）；
+// z>1 以 fit 尺寸为基准放大，图像中心 = 矩形中心 + (panx,pany)，超界部分按矩形裁剪
+// （对比模式左右两半各自裁剪，放大后互不越界）
+static void draw_image_zoom(HDC dc, RECT ir, const sp::Image& im, double z, int panx, int pany) {
+    int aw = ir.right - ir.left, ah = ir.bottom - ir.top;
+    double s0 = std::min((double)aw / im.w, (double)ah / im.h);
+    int dw = std::max(1, (int)(im.w * s0 * z));
+    int dh = std::max(1, (int)(im.h * s0 * z));
+    int dx = (ir.left + ir.right) / 2 + panx - dw / 2;
+    int dy = (ir.top + ir.bottom) / 2 + pany - dh / 2;
+    SaveDC(dc);
+    IntersectClipRect(dc, ir.left, ir.top, ir.right, ir.bottom);
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = im.w;
+    bmi.bmiHeader.biHeight = -im.h; // top-down
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    int prev_mode = SetStretchBltMode(dc, HALFTONE);
+    if (prev_mode) { POINT po = {0, 0}; SetBrushOrgEx(dc, po.x, po.y, &po); }
+    StretchDIBits(dc, dx, dy, dw, dh, 0, 0, im.w, im.h,
+                  im.px.data(), &bmi, DIB_RGB_COLORS, SRCCOPY);
+    if (prev_mode) SetStretchBltMode(dc, prev_mode);
+    RestoreDC(dc, -1);
 }
 
 // 预览卡矩形（draw_panel 与点击命中共用同一几何，避免两处漂移）。
@@ -1473,25 +1529,89 @@ static void param_scroll_by(int code, int pos) {
     }
 }
 
-// 弹窗大图：全分辨率解码 → 同一套算子预测 → 限长边 S(1100) → BGRA
-static void load_preview_popup_image() {
+// 弹窗大图：全分辨率解码原图 → （对比模式）同一套算子预测 → 限长边 S(1600) → BGRA
+// orig_only=true 仅加载原图（双击列表/缩略图的放大预览）；false 额外生成处理结果（对比右图）
+static void load_preview_popup_image(bool orig_only) {
     g_pv_pop_ok = false;
+    g_pv_pop_src_ok = false;
     g_pv_pop_img = sp::Image();
-    if (g_pv.item < 0 || g_pv.item >= (int)g_files.size() || !g_pv.src_ok) return;
+    g_pv_pop_src_img = sp::Image();
+    g_pv_zoom = 1.0; g_pv_pan_x = g_pv_pan_y = 0; // 新内容：缩放复位
+    g_pv_pop_src_label.clear();
+    g_pv_pop_dst_label.clear();
+    if (g_pv.item < 0 || g_pv.item >= (int)g_files.size()) return;
     sp::Image full;
     if (!sp::load_image(g_files[g_pv.item].path, full)) return;
+    const FileItem& f = g_files[g_pv.item];
+    {   // 原图标签：实际文件体积 + 原始分辨率
+        wchar_t sz[40], dim[32], lab[96];
+        fmt_size(f.bytes, sz, 40);
+        swprintf(dim, 32, L"%d×%d", full.w, full.h);
+        swprintf(lab, 96, L"原图（%s，%s）", sz, dim);
+        g_pv_pop_src_label = lab;
+    }
+    // 原图：缩到长边 S(1600) 转 BGRA 缓存（单图/对比模式左图共用）
+    g_pv_pop_src_img = full;
+    shrink_image_max(g_pv_pop_src_img, S(1600));
+    preview_bgra(g_pv_pop_src_img);
+    g_pv_pop_src_ok = true;
+    if (orig_only) return;
+    // 处理后：全分辨率跑同一套算子（与主窗预览一致），再缩放缓存
     Params p;
     collect_params(p);
     bool ps = false;
-    sp::Image out = preview_apply_ops(full, p, g_files[g_pv.item].w, ps);
+    sp::Image out = preview_apply_ops(full, p, f.w, ps);
+    // 指定体积压缩：真实算子在质量二分到 40 仍超标时会迭代降分辨率（ops.cpp 同款循环），
+    // 预览复刻同一预测（同一 compress_to_size + 同一降采样策略），使"处理后"的
+    // 分辨率与右图观感都与实际输出一致（此前走像素不变分支，标签错显原图分辨率）
+    if (g_module == MOD_COMPRESS_TARGET && p.target_kb > 0 && out.ok()) {
+        long long target = (long long)p.target_kb * 1000; // 与算子一致：1000 进制
+        bool src_jpeg = false;
+        {   size_t d = f.path.find_last_of(L'.');
+            std::wstring e = (d == std::wstring::npos) ? L"" : f.path.substr(d + 1);
+            for (auto& c : e) c = (wchar_t)towlower(c);
+            src_jpeg = (e == L"jpg" || e == L"jpeg");
+        }
+        // 达标 JPEG 直通/填充场景：算子直接复制原文件，分辨率不变，无需预测
+        if (!(src_jpeg && (long long)f.bytes <= target)) {
+            // 等价简化：compress_to_size 二分可达标时不降分辨率（标签尺寸不变），
+            // 不可达标（q40 编码仍超标）时返回的正是 q40 编码（二分全失败 best=最小体积=q40）。
+            // 故用一次 encode_jpg(·,40) 即可复现算子的降分辨率轨迹，
+            // 避免二分的 ~7 轮全尺寸编码把 UI 卡住数秒
+            auto data = encode_jpg(full, 40);
+            if ((long long)data.size() > target) {
+                double k = 1.0;
+                for (int it = 0; it < 10 && (long long)data.size() > target; ++it) {
+                    double ratio = std::sqrt((double)target / (double)data.size()) * 0.85;
+                    k = std::max(0.05, k * ratio);
+                    int sw = std::max(1, (int)llround(full.w * k));
+                    int sh = std::max(1, (int)llround(full.h * k));
+                    if (sw == full.w && sh == full.h) break; // 已到下限，与算子一致不再空转
+                    sp::Image scaled(sw, sh);
+                    resize_image(full, scaled);
+                    data = encode_jpg(scaled, 40);
+                    out = std::move(scaled); // 最后一轮缩放图 = 实际输出的分辨率与观感
+                }
+            }
+        }
+    }
     const sp::Image& base = out.ok() ? out : full;
+    {   // 处理后标签：预计输出体积（与列表“预计输出”列同一估算口径）+ 处理后分辨率
+        wchar_t sz[44], dim[32], lab[112];
+        fmt_est_kb(est_kb_for(f, p), sz, 44);
+        swprintf(dim, 32, L"%d×%d", base.w, base.h);
+        swprintf(lab, 112, L"处理后（%s，%s）", sz, dim);
+        g_pv_pop_dst_label = lab;
+    }
     g_pv_pop_img = base;
-    shrink_image_max(g_pv_pop_img, S(1600)); // 1100→1600：大屏下弹窗不再放大发糊
+    shrink_image_max(g_pv_pop_img, S(1600));
     preview_bgra(g_pv_pop_img);
     g_pv_pop_ok = true;
 }
 
 static LRESULT CALLBACK pop_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    static bool s_pan = false;        // 左键拖拽平移中（仅 zoom>1 时）
+    static POINT s_pan_last = {};
     switch (m) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
@@ -1499,16 +1619,104 @@ static LRESULT CALLBACK pop_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         RECT rc;
         GetClientRect(h, &rc);
         fill_rect(dc, rc, RGB(0xF7, 0xF8, 0xFA));
-        if (g_pv_pop_ok) {
-            RECT ir = {rc.left + S(16), rc.top + S(16), rc.right - S(16), rc.bottom - S(16)};
-            draw_image_fit(dc, ir, g_pv_pop_img);
+        const double z = g_pv_zoom;
+        const int px = g_pv_pan_x, py = g_pv_pan_y;
+        if (g_pv_pop_compare) {
+            // 对比模式：左半原图 / 右半处理后，各带顶部标签（黑字，体积+分辨率）
+            if (g_pv_pop_src_ok) {
+                int mid = (rc.left + rc.right) / 2;
+                int top = rc.top + S(12);
+                int img_top = top + S(24);
+                int bottom = rc.bottom - S(16);
+                RECT limg = {rc.left + S(16), img_top, mid - S(8), bottom};
+                RECT rimg = {mid + S(8), img_top, rc.right - S(16), bottom};
+                draw_image_zoom(dc, limg, g_pv_pop_src_img, z, px, py);
+                if (g_pv_pop_ok) draw_image_zoom(dc, rimg, g_pv_pop_img, z, px, py);
+                else draw_text(dc, L"无法加载处理结果", rimg, C_GRAY, g_font_small,
+                               DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                RECT llab = {limg.left, top, limg.right, img_top - S(2)};
+                RECT rlab = {rimg.left, top, rimg.right, img_top - S(2)};
+                draw_text(dc, g_pv_pop_src_label.c_str(), llab, RGB(0, 0, 0), g_font_pv,
+                          DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                draw_text(dc, g_pv_pop_dst_label.c_str(), rlab, RGB(0, 0, 0), g_font_pv,
+                          DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            } else {
+                draw_text(dc, L"无法加载预览", rc, C_GRAY, g_font_small,
+                          DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
         } else {
-            draw_text(dc, L"无法加载预览", rc, C_GRAY, g_font_small,
-                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            // 单图模式：原图 fit 铺满
+            if (g_pv_pop_src_ok) {
+                RECT ir = {rc.left + S(16), rc.top + S(16), rc.right - S(16), rc.bottom - S(16)};
+                draw_image_zoom(dc, ir, g_pv_pop_src_img, z, px, py);
+            } else {
+                draw_text(dc, L"无法加载预览", rc, C_GRAY, g_font_small,
+                          DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
         }
         EndPaint(h, &ps);
         return 0;
     }
+    case WM_MOUSEWHEEL: {
+        // 滚轮缩放：±25%，范围 1~8 倍；以光标为锚点（光标下的图像点缩放前后不动）。
+        // 对比模式左右两半共用同一缩放与平移（同步对比）
+        short delta = (short)HIWORD(wp);
+        double nz = g_pv_zoom * (delta > 0 ? 1.25 : 0.8);
+        nz = std::max(1.0, std::min(8.0, nz));
+        if (nz == g_pv_zoom) return 0;
+        RECT rc;
+        GetClientRect(h, &rc);
+        POINT pt = {(short)LOWORD(lp), (short)HIWORD(lp)};
+        ScreenToClient(h, &pt);
+        // 光标所在的图像矩形（对比模式按中线分左右；单图模式全窗）
+        RECT ir;
+        if (g_pv_pop_compare && g_pv_pop_src_ok) {
+            int mid = (rc.left + rc.right) / 2;
+            int img_top = rc.top + S(12) + S(24);
+            ir = pt.x < mid ? RECT{rc.left + S(16), img_top, mid - S(8), rc.bottom - S(16)}
+                            : RECT{mid + S(8), img_top, rc.right - S(16), rc.bottom - S(16)};
+        } else {
+            ir = {rc.left + S(16), rc.top + S(16), rc.right - S(16), rc.bottom - S(16)};
+        }
+        if (!PtInRect(&ir, pt)) return 0;
+        double s0 = std::min((double)(ir.right - ir.left) / std::max(1, g_pv_pop_src_img.w),
+                             (double)(ir.bottom - ir.top) / std::max(1, g_pv_pop_src_img.h));
+        int cx = (ir.left + ir.right) / 2, cy = (ir.top + ir.bottom) / 2;
+        // 图像点 =（光标 - 中心 - 平移）/ (s0*zoom)；放大后令该点仍在光标下
+        double ix = (pt.x - cx - g_pv_pan_x) / (s0 * g_pv_zoom);
+        double iy = (pt.y - cy - g_pv_pan_y) / (s0 * g_pv_zoom);
+        g_pv_zoom = nz;
+        g_pv_pan_x = (int)std::llround(pt.x - cx - ix * s0 * nz);
+        g_pv_pan_y = (int)std::llround(pt.y - cy - iy * s0 * nz);
+        if (g_pv_zoom <= 1.0) { g_pv_zoom = 1.0; g_pv_pan_x = g_pv_pan_y = 0; } // 回到 fit：平移复位
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    }
+    case WM_LBUTTONDOWN:
+        if (g_pv_zoom > 1.0) { // 缩放后左键拖拽平移
+            s_pan = true;
+            SetCapture(h);
+            s_pan_last = {(short)LOWORD(lp), (short)HIWORD(lp)};
+            SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+        }
+        return 0;
+    case WM_MOUSEMOVE:
+        if (s_pan) {
+            POINT pt = {(short)LOWORD(lp), (short)HIWORD(lp)};
+            g_pv_pan_x += pt.x - s_pan_last.x;
+            g_pv_pan_y += pt.y - s_pan_last.y;
+            s_pan_last = pt;
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        return 0;
+    case WM_LBUTTONUP:
+        if (s_pan) { s_pan = false; ReleaseCapture(); SetCursor(LoadCursorW(nullptr, IDC_ARROW)); }
+        return 0;
+    case WM_LBUTTONDBLCLK: // 双击复位缩放
+        g_pv_zoom = 1.0;
+        g_pv_pan_x = g_pv_pan_y = 0;
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) { DestroyWindow(h); return 0; }
         break;
@@ -1516,16 +1724,27 @@ static LRESULT CALLBACK pop_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         g_pv_pop = nullptr;
         g_pv_pop_ok = false;
         g_pv_pop_img = sp::Image();
+        g_pv_pop_src_ok = false;
+        g_pv_pop_src_img = sp::Image();
+        g_pv_pop_compare = false;
         return 0;
     }
     return DefWindowProcW(h, m, wp, lp);
 }
 
-// 点击预览卡 → 弹出大的正方形预览窗（边长≈工作区 75%，上限 S(880)）
-static void open_preview_popup() {
-    if (g_pv.item < 0 || g_pv.item >= (int)g_files.size() || !g_pv.dst_ok) {
-        MessageBoxW(g_hwnd, L"请先在列表中选中图片", L"SimplePic", MB_OK | MB_ICONINFORMATION);
-        return;
+// 弹窗预览：compare=true → 左原图/右处理后的对比窗（点击右侧预览卡）；
+// compare=false → 原图放大预览单图窗（双击列表/缩略图）
+static void open_preview_popup(bool compare) {
+    if (compare) {
+        if (g_pv.item < 0 || g_pv.item >= (int)g_files.size() || !g_pv.dst_ok) {
+            MessageBoxW(g_hwnd, L"请先在列表中选中图片", L"SimplePic", MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+    } else {
+        if (g_pv.item < 0 || g_pv.item >= (int)g_files.size()) {
+            MessageBoxW(g_hwnd, L"请先在列表中选中图片", L"SimplePic", MB_OK | MB_ICONINFORMATION);
+            return;
+        }
     }
     static bool reg = false;
     if (!reg) {
@@ -1539,25 +1758,39 @@ static void open_preview_popup() {
     }
     RECT wa;
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
-    int side = std::min(S(880), std::max(S(420),
-        (int)std::min<long long>((long long)wa.right * 3 / 4, (long long)wa.bottom * 3 / 4)));
-    RECT wr = {0, 0, side, side};
+    int fw, fh; // 窗口内容尺寸
+    if (compare) {
+        // 对比模式：宽扁（左右两半各能放下大图）
+        fw = std::min(S(1360), (int)wa.right * 9 / 10);
+        fh = std::min(S(820), (int)wa.bottom * 3 / 4);
+        fw = std::max(fw, S(760));
+        fh = std::max(fh, S(480));
+    } else {
+        // 原图模式：正方形大窗（原逻辑）
+        fw = fh = std::min(S(880), std::max(S(420),
+            (int)std::min<long long>((long long)wa.right * 3 / 4, (long long)wa.bottom * 3 / 4)));
+    }
+    RECT wr = {0, 0, fw, fh};
     AdjustWindowRect(&wr, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE);
     RECT mr;
     GetWindowRect(g_hwnd, &mr);
-    int x = mr.left + ((mr.right - mr.left) - side) / 2;
-    int y = mr.top + ((mr.bottom - mr.top) - side) / 2;
+    int x = mr.left + ((mr.right - mr.left) - (wr.right - wr.left)) / 2;
+    int y = mr.top + ((mr.bottom - mr.top) - (wr.bottom - wr.top)) / 2;
     if (!g_pv_pop) {
-        g_pv_pop = CreateWindowExW(WS_EX_APPWINDOW, L"SimplePicPreviewPop", L"预览",
+        g_pv_pop = CreateWindowExW(WS_EX_APPWINDOW, L"SimplePicPreviewPop",
+                                   compare ? L"对比预览" : L"原图预览",
                                    WS_POPUP | WS_CAPTION | WS_SYSMENU,
                                    x, y, wr.right - wr.left, wr.bottom - wr.top,
                                    g_hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
     } else {
         MoveWindow(g_pv_pop, x, y, wr.right - wr.left, wr.bottom - wr.top, TRUE);
     }
-    load_preview_popup_image();
+    g_pv_pop_compare = compare; // 先置模式再加载（pop_proc 绘制按此分支）
+    load_preview_popup_image(!compare);
     std::wstring name = std::filesystem::path(g_files[g_pv.item].path).filename().wstring();
-    SetWindowTextW(g_pv_pop, (L"预览（大图） - " + name).c_str());
+    const wchar_t* prefix = compare ? L"对比预览（左原图 / 右处理后 · 滚轮缩放 · 拖动平移 · 双击复位） - "
+                                    : L"原图预览（滚轮缩放 · 拖动平移 · 双击复位） - ";
+    SetWindowTextW(g_pv_pop, (std::wstring(prefix) + name).c_str());
     ShowWindow(g_pv_pop, SW_SHOW);
     SetForegroundWindow(g_pv_pop);
     InvalidateRect(g_pv_pop, nullptr, TRUE);
@@ -2168,6 +2401,7 @@ static void apply_col_width(int i, int w) {
     w = std::max(k_col_min(i), w);
     g_cw_user[i] = w;
     g_cw[i] = w;
+    g_cw_applied[i] = w; // 与 ListView 实际宽度保持同步（布局去重依赖）
     if (i == 0) g_name_col = g_cw[0];
     ListView_SetColumnWidth(g_list, i, w);
     InvalidateRect(g_hwnd, nullptr, FALSE); // 主窗口自绘表头重绘
@@ -2486,21 +2720,27 @@ static void layout_controls(HWND hwnd) {
     RECT rc;
     GetClientRect(hwnd, &rc);
     int W = rc.right, H = rc.bottom;
+    g_last_cx = W; g_last_cy = H; // 记录本次布局的客户区尺寸（WM_SIZE 去重用）
     LayoutGeom g = geom();
     g.main_w = W - g.panel_w - g.main_x;
 
     MoveWindow(g_sidebar, 0, S(66), g.side_w - S(22), H - g.bottom_h - S(66), TRUE); // 顶部 S(66)：品牌卡（LOGO+名称+版本）；右侧 S(22)：滚动条条带 + 右缘边距
-    InvalidateRect(g_sidebar, nullptr, TRUE); // 高度变化 → 重绘全部行（末组卡底边延伸随窗体高度更新）
     { // 末组卡随窗体增高：客户区比内容多出的高度并入最后一行行高（末组卡底=客户区底=红线，与文件列表卡对齐）
+      // 性能：仅高度变化时才重设行高并整列表重绘（拖拽横向尺寸时跳过，避免每像素全列表重绘）
+        static int s_last_side_h = -1;
         RECT src;
         GetClientRect(g_sidebar, &src);
-        int n = ListBox_GetCount(g_sidebar);
-        g_side_extra = 0;
-        int content = 0;
-        for (int i = 0; i < n; ++i) content += side_item_h(i);
-        g_side_extra = std::max(0, (int)src.bottom - content);
-        for (int i = 0; i < n; ++i)
-            SendMessageW(g_sidebar, LB_SETITEMHEIGHT, (WPARAM)i, MAKELPARAM(side_item_h(i), 0));
+        if (src.bottom != s_last_side_h) {
+            s_last_side_h = src.bottom;
+            InvalidateRect(g_sidebar, nullptr, TRUE); // 高度变化 → 重绘全部行（末组卡底边延伸随窗体高度更新）
+            int n = ListBox_GetCount(g_sidebar);
+            g_side_extra = 0;
+            int content = 0;
+            for (int i = 0; i < n; ++i) content += side_item_h(i);
+            g_side_extra = std::max(0, (int)src.bottom - content);
+            for (int i = 0; i < n; ++i)
+                SendMessageW(g_sidebar, LB_SETITEMHEIGHT, (WPARAM)i, MAKELPARAM(side_item_h(i), 0));
+        }
     }
     int toolbar_y = g.header_h + g.stats_h;
     MoveWindow(GetDlgItem(hwnd, IDC_BTN_ADD), g.main_x + S(16), toolbar_y + S(10), S(96), S(32), TRUE);
@@ -2511,16 +2751,23 @@ static void layout_controls(HWND hwnd) {
     MoveWindow(g_list, g.main_x, list_y, g.main_w - S(10), H - g.bottom_h - list_y, TRUE); // 底边=红线，与侧栏末组卡/处理按钮卡水平对齐
     { // 文件列表卡补倒角：区域裁剪（ListView 自身无圆角能力）。
       // 列表模式仅圆底角（顶部衔接列标题卡），缩略图模式四角全圆；半径与其他卡一致 S(10)
+      // 性能：仅列表尺寸/视图模式变化时才重建区域（SetWindowRgn 每像素调用是拖拽卡顿主因之一）
+        static int s_last_list_w = -1, s_last_list_h = -1, s_last_list_mode = -1;
         RECT lrc;
         GetClientRect(g_list, &lrc);
-        int r = S(10);
-        HRGN rgn = CreateRoundRectRgn(0, 0, lrc.right + 1, lrc.bottom + 1, r, r);
-        if (list_mode) {
-            HRGN top = CreateRectRgn(0, 0, lrc.right + 1, r); // 顶角方正，衔接上方列标题
-            CombineRgn(rgn, rgn, top, RGN_OR);
-            DeleteObject(top);
+        if (lrc.right != s_last_list_w || lrc.bottom != s_last_list_h || (int)list_mode != s_last_list_mode) {
+            s_last_list_w = lrc.right;
+            s_last_list_h = lrc.bottom;
+            s_last_list_mode = (int)list_mode;
+            int r = S(10);
+            HRGN rgn = CreateRoundRectRgn(0, 0, lrc.right + 1, lrc.bottom + 1, r, r);
+            if (list_mode) {
+                HRGN top = CreateRectRgn(0, 0, lrc.right + 1, r); // 顶角方正，衔接上方列标题
+                CombineRgn(rgn, rgn, top, RGN_OR);
+                DeleteObject(top);
+            }
+            SetWindowRgn(g_list, rgn, FALSE); // 不同步重绘：主窗口随后的整窗重绘已覆盖
         }
-        SetWindowRgn(g_list, rgn, TRUE); // 系统接管旧区域，随布局重建
     }
     if (list_mode) {
         // 7 列宽度：✕ 移除列固定宽不随窗体变化；窗体加宽时富余宽度全给文件名列；
@@ -2566,7 +2813,10 @@ static void layout_controls(HWND hwnd) {
         }
         g_name_col = g_cw[0];
         for (int i = 0; i < 7; ++i)
-            ListView_SetColumnWidth(g_list, i, g_cw[i]);
+            if (g_cw[i] != g_cw_applied[i]) { // 仅下发宽度变化的列（拖拽窗体时通常只有文件名列，避免每像素 7 次列表重排）
+                ListView_SetColumnWidth(g_list, i, g_cw[i]);
+                g_cw_applied[i] = g_cw[i];
+            }
     }
     MoveWindow(g_param_panel, W - g.panel_w, 0, g.panel_w, H - g.bottom_h, TRUE);
     RECT prc;
@@ -2651,7 +2901,7 @@ static LRESULT CALLBACK panel_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONDOWN: {
         // 点击预览卡 → 弹出大图预览窗
         POINT pt = {(short)LOWORD(lp), (short)HIWORD(lp)};
-        if (PtInRect(&preview_card_rect(h), pt)) open_preview_popup();
+        if (PtInRect(&preview_card_rect(h), pt)) open_preview_popup(true);
         break;
     }
     case WM_SETCURSOR: {
@@ -2740,6 +2990,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_font       = CreateFontW(-S(13), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
         g_font_bold  = CreateFontW(-S(13), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
         g_font_small = CreateFontW(-S(11), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
+        g_font_pv    = CreateFontW(-(S(11) + 2), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI"); // 预览对比窗标签：small 加大 2px
         g_font_h1    = CreateFontW(-S(16), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
         g_font_num   = CreateFontW(-S(20), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI"); // 统计卡数字：放大强调
         g_brush_white = CreateSolidBrush(C_CARD); // 参数控件在卡片内：背景=卡片色 F8F9FD
@@ -2854,9 +3105,13 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_SIZE:
+        if (wp == SIZE_MINIMIZED) return 0; // 最小化：尺寸无意义，跳过整轮布局（此前会以 0x0 布局一轮）
+        if ((int)LOWORD(lp) == g_last_cx && (int)HIWORD(lp) == g_last_cy && g_last_cx)
+            return 0; // 尺寸未变的重复 WM_SIZE：跳过
         layout_controls(hwnd);
         InvalidateRect(hwnd, nullptr, FALSE); // 全量重绘背景区，杜绝拉伸残影
-        UpdateWindow(hwnd);                   // 同步完成重绘，不等消息队列
+        // 不再调用 UpdateWindow：拖拽时每像素同步整窗重绘是卡顿主因，
+        // 改为靠消息队列合并重绘（多次 WM_SIZE → 一次 WM_PAINT，视觉无差异）
         return 0;
     case WM_GETMINMAXINFO: {
         auto* mmi = (MINMAXINFO*)lp;
@@ -2878,14 +3133,21 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HDC dc = BeginPaint(hwnd, &ps);
         RECT rc;
         GetClientRect(hwnd, &rc);
-        HDC mem = CreateCompatibleDC(dc);
-        HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
-        HBITMAP ob = (HBITMAP)SelectObject(mem, bmp);
-        paint_workspace(mem, rc);
-        BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
-        SelectObject(mem, ob);
-        DeleteObject(bmp);
-        DeleteDC(mem);
+        // 双缓冲位图缓存：拖拽/滚动时高频重绘，不再每次新建销毁整窗位图（仅尺寸变化时重建）
+        static HDC s_mem = nullptr;
+        static HBITMAP s_bmp = nullptr;
+        static int s_w = 0, s_h = 0;
+        if (!s_mem) s_mem = CreateCompatibleDC(dc);
+        if (!s_bmp || s_w != rc.right || s_h != rc.bottom) {
+            if (s_bmp) DeleteObject(s_bmp);
+            s_bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+            s_w = rc.right;
+            s_h = rc.bottom;
+        }
+        HBITMAP ob = (HBITMAP)SelectObject(s_mem, s_bmp);
+        paint_workspace(s_mem, rc);
+        BitBlt(dc, 0, 0, rc.right, rc.bottom, s_mem, 0, 0, SRCCOPY);
+        SelectObject(s_mem, ob);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -3034,6 +3296,19 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     refresh_preview();
                     InvalidateRect(g_hwnd, nullptr, FALSE);
                 }
+            }
+            return 0;
+        }
+        // 双击文件（列表模式行 / 缩略图模式图标）→ 打开原图放大预览弹窗
+        if (nm->idFrom == IDC_LIST && nm->code == NM_DBLCLK) {
+            auto nmv = (LPNMITEMACTIVATE)lp;
+            if (nmv->iItem >= 0 && nmv->iItem < (int)g_files.size()) {
+                if (!(ListView_GetItemState(g_list, nmv->iItem, LVIS_SELECTED) & LVIS_SELECTED)) {
+                    ListView_SetItemState(g_list, (DWORD)-1, 0, LVIS_SELECTED);
+                    ListView_SetItemState(g_list, nmv->iItem, LVIS_SELECTED, LVIS_SELECTED);
+                }
+                refresh_preview(); // 同步设置 g_pv.item（路径），原图预览只依赖它
+                open_preview_popup(false);
             }
             return 0;
         }
@@ -3311,6 +3586,15 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (HIWORD(wp) == CBN_SELCHANGE && base == 1) update_idphoto_custom_state();
             if (HIWORD(wp) == CBN_SELCHANGE && base == 6) update_crop_custom_state();
             if (HIWORD(wp) == CBN_SELCHANGE && base == 7) update_pdfmerge_state();
+            if (HIWORD(wp) == CBN_SELCHANGE && base == 2) update_target_custom_state();
+            if (HIWORD(wp) == EN_CHANGE && base == 16) { // 自定义体积 <1KB 自动退回 1KB（空框不干预，避免打断输入）
+                for (auto& e : g_ctls)
+                    if (e.type == CTL_EDIT && e.module == 16) {
+                        wchar_t b2[64] = {};
+                        GetWindowTextW(e.hwnd, b2, 64);
+                        if (b2[0] && _wtoi(b2) < 1) SetWindowTextW(e.hwnd, L"1");
+                    }
+            }
             // 水印颜色色块：点击选择（id=40..47），刷新所有色块
             if (HIWORD(wp) == BN_CLICKED && id >= 40 && id <= 47) {
                 g_wm_color_sel = id - 40;
@@ -3523,7 +3807,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     }
-    case WM_DESTROY:
+    case WM_DESTROY: {
         dbg_log(L"WM_DESTROY");
         thumb_shutdown();                      // 停掉缩略图解码线程
         if (g_pv_pop) DestroyWindow(g_pv_pop); // 主窗口关闭时顺带关闭大图预览弹窗
@@ -3531,6 +3815,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_pipe.cancel();
         PostQuitMessage(0);
         return 0;
+    }
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -3573,17 +3858,20 @@ HWND create_main_window(HINSTANCE hInst) {
     RegisterClassW(&wc);
 
     // 初始尺寸 = 最小尺寸（最小客户区 1280×762 + 非客户区外框，开窗即完整显示侧栏列表）；
-    // 屏幕更小时按工作区收，避免开窗超屏
+    // 屏幕更小时按工作区收，避免开窗超屏。
+    // 固定窗口：去掉 WS_THICKFRAME/WS_MAXIMIZEBOX → 不可拖拽调整大小、不可最大化
+    // （拖拽改变尺寸触发布局重算，真实拖拽下多次出现按钮错位等布局 bug，故整体锁定尺寸）
     RECT wa0 = {};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa0, 0);
+    const DWORD kMainStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
     int w0 = std::min(S(1280), (int)(wa0.right - wa0.left));
-    int h0 = std::min(S(762) + nc_frame_cy(WS_OVERLAPPEDWINDOW, g_dpi),
+    int h0 = std::min(S(762) + nc_frame_cy(kMainStyle, g_dpi),
                       (int)(wa0.bottom - wa0.top));
 
     // 不用 WS_EX_COMPOSITED：与 WS_CLIPCHILDREN / LVS_EX_DOUBLEBUFFER 叠加时
     // 合成缓冲中未绘制区域呈黑色（右侧黑面板根因）；主窗口已有自绘双缓冲，无需它
     HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"SimplePic 图片处理系统 v1.0",
-                                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                                kMainStyle,
                                 CW_USEDEFAULT, CW_USEDEFAULT, w0, h0,
                                 nullptr, nullptr, hInst, nullptr);
     ShowWindow(hwnd, SW_SHOW);

@@ -1,0 +1,29 @@
+# 构建产物
+build/
+*.obj
+*.exe
+*.res
+*.pdb
+*.ilk
+
+# 构建日志与临时文件
+build_log.txt
+build_out.txt
+dpi_*
+pdf_*.obj
+crop_test.obj
+gui_probe.obj
+smart_test.obj
+jpeg_meta.obj
+
+# 第三方压缩包与下载日志
+third_party/webp.zip
+third_party/dl_log.txt
+third_party/dl_result.txt
+third_party/extract_log.txt
+
+# 测试输出
+tests/out/
+
+# 工作目录
+.workbuddy/
